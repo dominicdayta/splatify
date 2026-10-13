@@ -1,0 +1,254 @@
+\documentclass[aspectratio=169,10pt]{beamer}
+
+\usetheme{Boadilla}
+\usecolortheme{seahorse}
+\setbeamertemplate{navigation symbols}{}
+
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  showstringspaces=false,
+  keepspaces=true
+}
+
+\title[4DGS in a Chrome tab]{60 FPS 4D Gaussian Splatting in a Chrome Tab}
+\subtitle{How a moving capture becomes something you can open}
+\author{Mind In a Device}
+\institute{Monthly Tech Talk}
+\date{October 2026}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Why this talk}
+  We have been looking at Gaussian splatting as a reconstruction method. I write JavaScript, so my question starts after the fit exists.
+
+  \vspace{0.7em}
+  A moving scene still has to reach someone whose machine has a browser.
+
+  \vspace{0.7em}
+  Rust writes that file once. JavaScript is the program that plays it.
+\end{frame}
+
+\begin{frame}{Where this hour goes}
+  \begin{enumerate}
+    \item The 3D Gaussian representation, and what a time axis does to it.
+    \item Why a folder of raw frames misses a browser.
+    \item The \texttt{.splat4d} file, and which language plays it back.
+    \item One scene, on this laptop.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{3D Gaussian splatting}
+  Kerbl et al., SIGGRAPH 2023. A scene is a set of anisotropic Gaussians, fit to calibrated images.
+  \[
+    G_i(\mathbf{x})
+    =\exp\!\Bigl(-\tfrac12(\mathbf{x}-\mu_i)^{\!\top}\Sigma_i^{-1}(\mathbf{x}-\mu_i)\Bigr),
+    \qquad
+    \Sigma_i = R_i S_i S_i^{\!\top} R_i^{\!\top}.
+  \]
+  Projected into the image, and composited in depth order:
+  \[
+    C(\mathbf{p})
+    =\sum_{i\in\mathcal{N}}
+      c_i\,\alpha_i(\mathbf{p})
+      \prod_{j<i}\bigl(1-\alpha_j(\mathbf{p})\bigr).
+  \]
+  \small
+  The photometric loss and the densification are offline. Playback is projection, sorting, and blending.
+\end{frame}
+
+\begin{frame}{Time turns each parameter into a track}
+  \[
+    G_i(t)=\{\mu_i(t),\,\Sigma_i(t),\,c_i(t),\,\alpha_i(t)\}.
+  \]
+  DyNeRF \textit{juggle}, the usual benchmark:
+  \[
+    150 \times 336{,}568 \times 32\,\mathrm{B} = \mathbf{1.62\,GB}.
+  \]
+  Those 32 bytes are $\mu$, scale, RGBA, and a quaternion. Color in this container is diffuse RGB.
+\end{frame}
+
+\begin{frame}{Where a folder of frames falls over}
+  Zstandard on the raw floats reaches about $2.5\times$. The low bits of a mantissa look random.
+
+  \vspace{0.8em}
+  A new typed array on every frame eventually pauses the tab for garbage collection.
+
+  \vspace{0.8em}
+  The composite above depends on depth order, and motion invalidates that order every frame. A general sort of $\sim$300k keys on the main thread runs past a 16\,ms frame.
+\end{frame}
+
+\begin{frame}{The \texttt{.splat4d} file}
+  Adam Raudonis, 2026. Choose a tolerance first. Two millimeters is the usual position bound. After that, the Rust encoder and the JavaScript player share one integer representation.
+
+  \vspace{0.5em}
+  \begin{enumerate}
+    \item A property whose whole track fits in the tolerance is stored once.
+    \item Every other value is rounded onto a grid that enforces the tolerance.
+    \item A stored value changes only when the tolerance would break.
+    \item Time is cut into independent chunks of about a second.
+    \item Those integers are reordered, then compressed with Zstandard.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Still properties are stored once}
+  A property is static when its range over the clip fits in one bin:
+  \[
+    \max_t A_i(t)-\min_t A_i(t)\le 2\epsilon_A.
+  \]
+  \textit{Juggle}, default tolerance. Position is static for 79\% of splats, and the static section is about 4 MB. Scale and opacity are entirely static.
+
+  \vspace{0.5em}
+  Color is static for 4\% of splats. Color deltas are 53.5 MB of the 83.4 MB file, because that capture's colors flicker.
+\end{frame}
+
+\begin{frame}{Quantize, then hold}
+  Grid spacing is twice the tolerance, the same construction as SZ and ZFP.
+  \[
+    \Delta=2\epsilon, \qquad |x-\hat{x}|\le\epsilon.
+  \]
+  A value on a bin edge would hop every frame. Hold keeps the previous code while the measurement stays inside its tolerance:
+  \[
+    \hat{x}_t=
+    \begin{cases}
+      \hat{x}_{t-1} & \text{if }|x_t-\hat{x}_{t-1}|\le\epsilon,\\
+      Q(x_t) & \text{otherwise.}
+    \end{cases}
+  \]
+  Defaults: $\pm 2$\,mm, $\pm 4/255$ color, exact rotation, $\pm 2\%$ scale. The encoder checks every splat of every frame.
+\end{frame}
+
+\begin{frame}{Closed groups, fetched by range}
+  Groups of 30 frames. Each opens with a keyframe, and the rest are integer deltas. A group decodes from the static section alone.
+
+  \vspace{0.6em}
+  \begin{enumerate}
+    \item \texttt{bytes=0-262143}: header and byte offsets.
+    \item The static section: enough to draw the first view.
+    \item On a scrub, the one group covering that time. Keys first, then deltas.
+  \end{enumerate}
+
+  \vspace{0.4em}
+  Published at 50 Mbps: first view in 791\,ms, cold keyframe in 145\,ms.
+\end{frame}
+
+\begin{frame}{What JavaScript is for}
+  \begin{tabular}{@{}llp{0.46\textwidth}@{}}
+    \toprule
+    & \textbf{When} & \textbf{Job} \\
+    \midrule
+    Rust & once, offline & Read the frames and write \texttt{.splat4d}. \\
+    Python & around that tool & Install the binary. Serve the file today. \\
+    JavaScript & every frame, in the tab & Fetch, decode, sort, and launch the draw. \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.8em}
+  The draw shader is WGSL. JavaScript builds that pipeline, fills the buffers, and chooses the frame.
+
+  \vspace{0.5em}
+  The depth sort is in the JavaScript worker, next to the decoder.
+\end{frame}
+
+\begin{frame}{WebGPU}
+  The GPU API for the browser. Shaders are WGSL. On this Mac, Chrome runs them on Metal.
+
+  \vspace{0.35em}
+  \centering
+  \texttt{github.com/gpuweb/gpuweb}
+
+  \vspace{0.7em}
+  \raggedright
+  WebGL let a page rasterize. A compute dispatch, and a storage buffer that dispatch can read, sit outside WebGL.
+
+  \vspace{0.55em}
+  The depth order in the composite has to be rebuilt whenever the splats move. This demo still sorts in JavaScript, and it can draw through WebGL2. WebGPU is what makes that sort expressible as a compute pass in the tab, which is how a native 4D renderer already does it.
+\end{frame}
+
+\begin{frame}[fragile]{The player}
+  A worker thread owns decode and sort, so the camera thread stays free. \texttt{fzstd} is the Zstandard decompressor, written in JavaScript.
+  \begin{lstlisting}
+const probe = await fetch(url, {
+  headers: { Range: "bytes=0-262143" }
+});
+const rangeMode = probe.status === 206;
+
+function unzigzag(z: number): number {
+  return (z >>> 1) ^ -(z & 1);
+}
+  \end{lstlisting}
+  \small
+  Counting sort on 16-bit depth keys, skipped when the view has barely moved. WebGPU draws. The same player uses WebGL2 when WebGPU is absent.
+\end{frame}
+
+\begin{frame}{Published sizes}
+  \centering
+  \small
+  \begin{tabular}{@{}lrrl@{}}
+    \toprule
+    & \textbf{Raw} & \textbf{File} & \\
+    \midrule
+    Juggle, default tolerance & 1.62 GB & 83.4 MB & $19.4\times$ \\
+    Juggle, coarse, colors smoothed & 1.62 GB & 40.9 MB & $39.5\times$ \\
+    Best generic lossless & 1.62 GB & 642 MB & $2.5\times$ \\
+    Flame, default tolerance & 427 MB & 18.5 MB & $23\times$ \\
+    Flame, looser tolerance & 427 MB & 7.4 MB & $58\times$ \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.7em}
+  \raggedright
+  Lossless compression of the floats stops at $2.5\times$. Rounding is what reaches the other rows.
+
+  \vspace{0.4em}
+  Flame is the clip I will open. At $\pm 2$\,mm about 16\% of its positions are static, because the fire moves. Its colors are entirely static.
+\end{frame}
+
+\begin{frame}{Who has to open the file}
+  A finished reconstruction often lives on the workstation that produced it. The next person may only have a browser.
+
+  \vspace{0.7em}
+  A pantograph meeting a contact wire, or a pole whose cables move: the still parts are stored once, and the motion is the delta stream.
+
+  \vspace{0.7em}
+  Those are sketches for a client conversation. In the room today, we have the file and the tab.
+\end{frame}
+
+\begin{frame}{Three things to keep}
+  The tolerance is a number in millimeters, and the file is what makes a gigabyte fit through a browser.
+
+  \vspace{0.7em}
+  JavaScript fetches, decodes, sorts, and launches the draw.
+
+  \vspace{0.7em}
+  The capture can leave the lab as a link.
+
+  \vspace{1em}
+  \centering
+  \Large Chrome is open.
+\end{frame}
+
+\begin{frame}{References}
+  \footnotesize
+  \begin{itemize}
+    \item Kerbl, Kopanas, Leimk\"uhler, Drettakis. \textit{3D Gaussian Splatting for Real-Time Radiance Field Rendering.} ACM TOG (SIGGRAPH), 2023.
+    \item Luiten, Kopanas, Leibe, Ramanan. \textit{Dynamic 3D Gaussians: Tracking by Persistent Dynamic View Synthesis.} 3DV, 2024.
+    \item Wu et al. \textit{4D Gaussian Splatting for Real-Time Dynamic Scene Rendering.} CVPR, 2024.
+    \item Raudonis. \textit{splats4D: a streamable 4D Gaussian splat format with tunable error bounds.} \texttt{github.com/adamraudonis/splats4D}, 2026.
+    \item W3C GPU for the Web Community Group. \textit{WebGPU} and \textit{WebGPU Shading Language.}
+  \end{itemize}
+  \vspace{0.4em}
+  The byte shuffling step is the same idea used by Blosc and by the SPZ and SOGS splat packers. The drawing code is a port of Kevin Kwok's \texttt{antimatter15/splat} viewer.
+\end{frame}
+
+\end{document}

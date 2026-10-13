@@ -1,0 +1,8 @@
+# PyTorch is installed first, from the CUDA wheel index.
+# This file must not pull a CPU torch wheel, so torch is not listed here.
+# gsplat is pinned to v1.5.3 so the library matches the trainer the script clones.
+gsplat==1.5.3
+plyfile
+numpy<2
+imageio
+splats4d
