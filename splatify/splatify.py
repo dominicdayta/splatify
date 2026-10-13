@@ -10,11 +10,13 @@ Ubuntu machine with an RTX 3090 Ti.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -25,13 +27,24 @@ OUT_ROOT = ROOT / "out"
 GSPLAT_COMMIT = "937e29912570c372bed6747a5c9bf85fed877bae"
 GSPLAT_URL = "https://github.com/nerfstudio-project/gsplat.git"
 GSPLAT_DIR = ROOT / "third_party" / "gsplat"
+SSIM_SHIM = ROOT / "ssim_fallback"
+# These import torch while pip is still building an isolated environment, and
+# they compile CUDA against whatever nvcc is installed. This pipeline's torch
+# wheel and the system nvcc are not the same CUDA major version.
+SKIP_EXAMPLE_PACKAGES = ("fused-ssim", "fused-bilagrid")
 
 
-def run(cmd: list[str], *, cwd: Path | None = None, log: Path | None = None) -> None:
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    log: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
     print("+", " ".join(cmd), flush=True)
     if log is None:
         try:
-            subprocess.run(cmd, cwd=cwd, check=True)
+            subprocess.run(cmd, cwd=cwd, check=True, env=env)
         except subprocess.CalledProcessError as exc:
             raise SystemExit(
                 f"Command failed with exit code {exc.returncode}: {' '.join(cmd)}"
@@ -45,6 +58,7 @@ def run(cmd: list[str], *, cwd: Path | None = None, log: Path | None = None) -> 
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=env,
         )
         assert process.stdout is not None
         for line in process.stdout:
@@ -166,6 +180,10 @@ def run_colmap(data_dir: Path) -> None:
     images = data_dir / "images"
     sparse = data_dir / "sparse"
     sparse.mkdir(parents=True, exist_ok=True)
+    # COLMAP's CLI still starts Qt. This build's GPU SIFT path also needs an
+    # OpenGL context, which a headless shell does not have, so use CPU SIFT.
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
     run(
         [
             "colmap",
@@ -178,7 +196,10 @@ def run_colmap(data_dir: Path) -> None:
             "1",
             "--ImageReader.camera_model",
             "SIMPLE_RADIAL",
-        ]
+            "--FeatureExtraction.use_gpu",
+            "0",
+        ],
+        env=env,
     )
     run(
         [
@@ -188,7 +209,10 @@ def run_colmap(data_dir: Path) -> None:
             str(database),
             "--SequentialMatching.overlap",
             "10",
-        ]
+            "--FeatureMatching.use_gpu",
+            "0",
+        ],
+        env=env,
     )
     run(
         [
@@ -200,7 +224,8 @@ def run_colmap(data_dir: Path) -> None:
             str(images),
             "--output_path",
             str(sparse),
-        ]
+        ],
+        env=env,
     )
     model = choose_colmap_model(sparse)
     target = sparse / "0"
@@ -281,13 +306,92 @@ def ensure_gsplat() -> Path:
         run(["git", "-C", str(GSPLAT_DIR), "checkout", "FETCH_HEAD"])
     stamp = GSPLAT_DIR / ".splatify-example-deps"
     if not stamp.is_file():
-        print("Installing the gsplat example requirements into this environment.")
-        run(
-            [sys.executable, "-m", "pip", "install", "-r", "examples/requirements.txt"],
-            cwd=GSPLAT_DIR,
-        )
+        install_example_requirements()
         stamp.write_text("ok\n", encoding="utf-8")
     return trainer
+
+
+def install_example_requirements() -> None:
+    source = GSPLAT_DIR / "examples" / "requirements.txt"
+    packages: list[str] = []
+    for raw in source.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or any(name in line for name in SKIP_EXAMPLE_PACKAGES):
+            continue
+        packages.append(line)
+    print("Installing the gsplat example requirements into this environment.")
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write("\n".join(packages) + "\n")
+        filtered = Path(handle.name)
+    try:
+        run(
+            [sys.executable, "-m", "pip", "install", "-r", str(filtered)],
+            cwd=GSPLAT_DIR,
+        )
+    finally:
+        filtered.unlink(missing_ok=True)
+    install_matching_torchvision()
+
+
+def install_matching_torchvision() -> None:
+    """torchmetrics installs a PyPI torchvision built for a different CUDA.
+
+    PyTorch 2.minor.patch pairs with torchvision 0.(minor + 15).patch.
+    """
+    import torch
+
+    cuda = torch.version.cuda
+    if not cuda:
+        return
+    base = torch.__version__.split("+", 1)[0]
+    major, minor, patch = (int(part) for part in base.split(".")[:3])
+    if major != 2:
+        raise SystemExit(
+            f"This pipeline expects PyTorch 2.x, and found {torch.__version__}."
+        )
+    version = f"0.{minor + 15}.{patch}"
+    tag = "cu" + cuda.replace(".", "")
+    run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            f"torchvision=={version}",
+            "--index-url",
+            f"https://download.pytorch.org/whl/{tag}",
+        ]
+    )
+
+
+def require_cuda() -> None:
+    try:
+        import torch
+    except ImportError as exc:
+        raise SystemExit(
+            "PyTorch is not installed. Install the CUDA wheel before running this pipeline."
+        ) from exc
+    if torch.cuda.is_available():
+        return
+    raise SystemExit(
+        "PyTorch cannot see a CUDA device, so gsplat cannot train. "
+        "nvidia-smi cannot reach the driver: the NVIDIA kernel module is not loaded. "
+        "Load it, then rerun this command."
+    )
+
+
+def trainer_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if importlib.util.find_spec("fused_ssim") is None:
+        previous = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            str(SSIM_SHIM) + os.pathsep + previous if previous else str(SSIM_SHIM)
+        )
+    return env
 
 
 def train(data_dir: Path, result_dir: Path, steps: int, data_factor: int) -> Path:
@@ -320,6 +424,7 @@ def train(data_dir: Path, result_dir: Path, steps: int, data_factor: int) -> Pat
         ],
         cwd=trainer.parent,
         log=log,
+        env=trainer_env(),
     )
     ply_dir = result_dir / "ply"
     plies = list(ply_dir.glob("point_cloud_*.ply")) if ply_dir.is_dir() else []
@@ -400,6 +505,7 @@ def main() -> None:
 
     for tool in ("ffmpeg", "ffprobe", "colmap", "git", "splat4d"):
         require_tool(tool)
+    require_cuda()
 
     data_dir = WORK_ROOT / name
     if data_dir.exists():
